@@ -1,1 +1,105 @@
+name: Grade Submission
 
+on:
+  pull_request_target:
+    branches: [ main ]
+    types: [opened, synchronize, reopened]
+
+jobs:
+  grade:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+
+    steps:
+      - name: Checkout main branch
+        uses: actions/checkout@v3
+        with:
+          ref: main
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Fetch PR submission files
+        run: |
+          git fetch origin pull/${{ github.event.pull_request.number }}/head:pr_branch
+          git checkout pr_branch -- submission/
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install pandas scikit-learn
+
+      - name: Write secret labels to file
+        run: echo "${{ secrets.TEST_LABELS }}" > grader/test_labels.csv
+
+      - name: Check submission file exists
+        run: |
+          count=$(find submission/ -name "*.csv" | wc -l)
+          if [ "$count" -eq 0 ]; then
+            echo "❌ No submission file found!"
+            exit 1
+          fi
+          echo "✅ Found submission file"
+
+      - name: Run grader and update leaderboard
+        env:
+          GROUP_NAME: ${{ github.event.pull_request.user.login }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          python grader/grader.py | tee grader_output.txt
+          python3 - <<'EOF'
+          import json, os
+
+          result_path = "leaderboard_data/result.json"
+          lb_path     = "docs/leaderboard.json"
+
+          if not os.path.exists(result_path):
+              print("No result found")
+              exit(0)
+
+          with open(result_path) as f:
+              new = json.load(f)
+
+          lb = json.load(open(lb_path)) if os.path.exists(lb_path) else []
+
+          existing = next((e for e in lb if e["group"] == new["group"]), None)
+          if existing:
+              if new["f1_score"] > existing["f1_score"]:
+                  lb = [e for e in lb if e["group"] != new["group"]]
+                  lb.append(new)
+                  print(f"Updated {new['group']} to F1: {new['f1_score']}")
+              else:
+                  print(f"Kept better score for {new['group']}")
+          else:
+              lb.append(new)
+              print(f"Added {new['group']} with F1: {new['f1_score']}")
+
+          with open(lb_path, "w") as f:
+              json.dump(lb, f, indent=2)
+          print("Leaderboard saved!")
+          EOF
+
+      - name: Commit and push leaderboard
+        run: |
+          git config --global user.name "github-actions"
+          git config --global user.email "actions@github.com"
+          git add docs/leaderboard.json
+          git diff --staged --quiet || git commit -m "Update leaderboard after PR #${{ github.event.pull_request.number }}"
+          git push origin main
+
+      - name: Post score as PR comment
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const fs = require('fs');
+            const output = fs.readFileSync('grader_output.txt', 'utf8');
+            const group = context.payload.pull_request.user.login;
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `## 🏆 Grading Result\n**Group:** ${group}\n\`\`\`\n${output}\n\`\`\`\n> Push a new commit to improve your score!`
+            });
